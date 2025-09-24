@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="origin-trial" content="" />
+    <title>PoseCam (WASM) MVP</title>
+    <style>
+      html, body { margin: 0; padding: 0; height: 100%; background: #0b0f14; color: #e6eef7; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji"; }
+      #app { position: relative; height: 100%; width: 100%; overflow: hidden; }
+      video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+      canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+      .hud { position: absolute; top: 12px; right: 12px; background: rgba(0,0,0,0.45); border: 1px solid rgba(255,255,255,0.15); border-radius: 8px; padding: 8px 10px; font-size: 12px; backdrop-filter: blur(6px); }
+      .panel { position: absolute; bottom: 12px; left: 12px; display: flex; gap: 8px; background: rgba(0,0,0,0.45); border: 1px solid rgba(255,255,255,0.15); border-radius: 10px; padding: 8px; backdrop-filter: blur(6px); }
+      button, select { appearance: none; border: 1px solid rgba(255,255,255,0.25); background: rgba(255,255,255,0.06); color: #e6eef7; padding: 8px 12px; border-radius: 8px; font-size: 14px; cursor: pointer; }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
+      .msg { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); background: rgba(0,0,0,0.65); border: 1px solid rgba(255,255,255,0.15); padding: 14px 16px; border-radius: 10px; font-size: 14px; max-width: 90vw; }
+      a { color: #9cd1ff; }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <video id="cam" autoplay playsinline muted></video>
+      <canvas id="viz"></canvas>
+      <div class="hud" id="hud">FPS: -, Quality: -, Res: -×-, Scale: -, Facing: -, Pose: -</div>
+      <div class="panel">
+        <button id="btn" type="button">Start</button>
+        <label>
+          Quality
+          <select id="quality">
+            <option value="low" selected>Low (480p)</option>
+            <option value="med">Med (720p)</option>
+          </select>
+        </label>
+        <button id="flip" type="button">Flip</button>
+      </div>
+      <div class="msg" id="msg" hidden></div>
+    </div>
+
+    <script type="module">
+      import { FilesetResolver, PoseLandmarker, DrawingUtils } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest";
+
+      const video = document.getElementById("cam");
+      const canvas = document.getElementById("viz");
+      const ctx = canvas.getContext("2d");
+      const btn = document.getElementById("btn");
+      const quality = document.getElementById("quality");
+      const hud = document.getElementById("hud");
+      const msg = document.getElementById("msg");
+      const flipBtn = document.getElementById("flip");
+
+      const QUALITY_TO_CONSTRAINT = {
+        low: { width: 640, height: 480 },
+        med: { width: 1280, height: 720 },
+      };
+
+      let stream = null;
+      let currentFacing = "user"; // or "environment"
+      let landmarker = null;
+      let running = false;
+      let rafId = 0;
+      let emaFps = 0;
+      let lastT = 0;
+      let internalScale = 0.85; // アダプティブ対象の内部処理スケール
+      const targetFps = 24;
+
+      function showMessage(text) {
+        msg.textContent = text;
+        msg.hidden = false;
+      }
+      function clearMessage() {
+        msg.hidden = true;
+        msg.textContent = "";
+      }
+
+      function isSecureContextOk() {
+        return location.protocol === "https:" || location.hostname === "localhost" || location.hostname === "127.0.0.1";
+      }
+
+      async function ensureLandmarker() {
+        if (landmarker) return landmarker;
+        const vision = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+        );
+        landmarker = await PoseLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath:
+              "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+          },
+          runningMode: "VIDEO",
+          numPoses: 1,
+        });
+        return landmarker;
+      }
+
+      async function startCamera() {
+        const q = quality.value;
+        const constraint = QUALITY_TO_CONSTRAINT[q] || QUALITY_TO_CONSTRAINT.low;
+        const constraints = { video: { ...constraint, facingMode: currentFacing }, audio: false };
+        try {
+          stream = await navigator.mediaDevices.getUserMedia(constraints);
+        } catch (err) {
+          const name = err?.name || "Error";
+          if (name === "NotAllowedError") {
+            showMessage("カメラへのアクセスが拒否されました。ブラウザの設定で許可してください。");
+          } else if (name === "NotFoundError" || name === "OverconstrainedError") {
+            showMessage("要求されたカメラが見つかりません。別の品質や向きをお試しください。");
+          } else if (name === "NotReadableError") {
+            showMessage("カメラを使用できません。他のアプリで使用中の可能性があります。");
+          } else if (!isSecureContextOk()) {
+            showMessage("この機能にはHTTPSが必要です。localhostでの開発は例外です。");
+          } else {
+            showMessage(`カメラ取得エラー: ${err?.message || err}`);
+          }
+          throw err;
+        }
+        video.srcObject = stream;
+        await video.play();
+        fitCanvasToVideo();
+      }
+
+      function stopCamera() {
+        if (!stream) return;
+        for (const track of stream.getTracks()) track.stop();
+        stream = null;
+        video.srcObject = null;
+      }
+
+      function fitCanvasToVideo() {
+        const { videoWidth, videoHeight } = video;
+        if (!videoWidth || !videoHeight) return;
+        canvas.width = videoWidth;
+        canvas.height = videoHeight;
+      }
+
+      function updateHud(hasPose) {
+        const q = quality.value;
+        const fps = emaFps ? emaFps.toFixed(1) : "-";
+        const poseStr = hasPose ? "yes" : "no";
+        const resW = canvas.width || 0;
+        const resH = canvas.height || 0;
+        const scalePct = Math.round(internalScale * 100);
+        const facing = currentFacing;
+        hud.textContent = `FPS: ${fps}, Quality: ${q}, Res: ${resW}×${resH}, Scale: ${scalePct}%, Facing: ${facing}, Pose: ${poseStr}`;
+      }
+
+      function updateEmaFps(now) {
+        if (!lastT) { lastT = now; return; }
+        const dt = Math.max(1, now - lastT);
+        const instFps = 1000 / dt;
+        lastT = now;
+        // EMA
+        const alpha = 0.2;
+        emaFps = alpha * instFps + (1 - alpha) * (emaFps || instFps);
+      }
+
+      function adaptiveScale() {
+        if (!emaFps) return;
+        if (emaFps < targetFps - 1) {
+          internalScale = Math.max(0.5, internalScale * 0.9);
+        } else if (emaFps > targetFps + 2) {
+          internalScale = Math.min(1.0, internalScale * 1.02);
+        }
+      }
+
+      const offscreen = document.createElement("canvas");
+      const offctx = offscreen.getContext("2d");
+      const drawer = new DrawingUtils(ctx);
+
+      async function loop() {
+        if (!running) return;
+        const now = performance.now();
+        updateEmaFps(now);
+        adaptiveScale();
+
+        // 背景
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        // 内部縮小して推論
+        const iw = Math.max(16, Math.floor(canvas.width * internalScale));
+        const ih = Math.max(16, Math.floor(canvas.height * internalScale));
+        if (offscreen.width !== iw || offscreen.height !== ih) {
+          offscreen.width = iw; offscreen.height = ih;
+        }
+        offctx.drawImage(video, 0, 0, iw, ih);
+
+        const res = await landmarker.detectForVideo(video, now);
+        let hasPose = false;
+        if (res?.landmarks?.length) {
+          hasPose = true;
+          const lm = res.landmarks[0];
+          drawer.drawLandmarks(lm);
+          drawer.drawConnectors(lm, PoseLandmarker.POSE_CONNECTIONS);
+        }
+        updateHud(hasPose);
+
+        rafId = requestAnimationFrame(loop);
+      }
+
+      async function start() {
+        clearMessage();
+        if (!isSecureContextOk()) {
+          showMessage("この機能にはHTTPSが必要です。ローカル開発は localhost でご利用ください。");
+          return;
+        }
+        try {
+          btn.disabled = true;
+          await ensureLandmarker();
+          await startCamera();
+          running = true;
+          btn.textContent = "Stop";
+          quality.disabled = true;
+          flipBtn.disabled = true;
+          rafId = requestAnimationFrame(loop);
+        } catch (e) {
+          console.error(e);
+          if (msg.hidden) {
+            showMessage(`エラー: ${e?.message || e}`);
+          }
+          btn.textContent = "Start";
+          running = false;
+          stopCamera();
+        } finally {
+          btn.disabled = false;
+        }
+      }
+
+      function stop() {
+        running = false;
+        if (rafId) cancelAnimationFrame(rafId);
+        stopCamera();
+        btn.textContent = "Start";
+        quality.disabled = false;
+        flipBtn.disabled = false;
+      }
+
+      btn.addEventListener("click", () => {
+        if (running) stop(); else start();
+      });
+
+      quality.addEventListener("change", async () => {
+        if (!running) return;
+        stopCamera();
+        await startCamera();
+      });
+
+      flipBtn.addEventListener("click", async () => {
+        currentFacing = currentFacing === "user" ? "environment" : "user";
+        if (!running) return;
+        stopCamera();
+        await startCamera();
+      });
+
+      window.addEventListener("resize", fitCanvasToVideo);
+      video.addEventListener("loadedmetadata", fitCanvasToVideo);
+
+      // 初期メッセージ
+      if (!isSecureContextOk()) {
+        showMessage("HTTPS で開いてください（開発は localhost 可）。Start で権限を付与します。");
+      }
+    </script>
+  </body>
+  </html>
+
+
